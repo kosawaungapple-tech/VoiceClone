@@ -3,10 +3,11 @@ import path from "node:path";
 
 const isVercel = process.env.VERCEL === "1";
 
-// On Vercel: .env.local writes are not possible (read-only filesystem outside /tmp).
-// API keys must be set as Vercel Environment Variables in the dashboard.
-// We still support reading from process.env so Vercel env vars work normally.
-const envLocalPath = path.join(process.cwd(), ".env.local");
+// Local dev: project root .env.local
+// Vercel: /tmp/thalika-data/runtime.env (writable, ephemeral per-instance)
+const envLocalPath = isVercel
+  ? path.join("/tmp", "thalika-data", "runtime.env")
+  : path.join(process.cwd(), ".env.local");
 
 function parseEnvValue(line: string) {
   const separatorIndex = line.indexOf("=");
@@ -24,8 +25,11 @@ export function maskSecret(value: string) {
   return `${value.slice(0, 4)}••••${value.slice(-4)}`;
 }
 
+async function ensureEnvDir() {
+  await fs.mkdir(path.dirname(envLocalPath), { recursive: true });
+}
+
 export async function readEnvLocal() {
-  if (isVercel) return "";
   try {
     return await fs.readFile(envLocalPath, "utf8");
   } catch (error) {
@@ -37,23 +41,19 @@ export async function readEnvLocal() {
 }
 
 export async function readEnvKey(key: string) {
-  // On Vercel: always read from process.env (set via Vercel dashboard)
-  if (isVercel) {
-    return process.env[key]?.trim() || "";
-  }
+  // First: check runtime file (covers both local .env.local and Vercel /tmp)
   const content = await readEnvLocal();
   const line = content
     .split(/\r?\n/)
     .find((entry) => entry.trim().startsWith(`${key}=`));
-  return line ? parseEnvValue(line) : (process.env[key]?.trim() || "");
+  if (line) return parseEnvValue(line);
+
+  // Fallback: process.env (covers Vercel Dashboard env vars)
+  return process.env[key]?.trim() || "";
 }
 
 export async function writeEnvKey(key: string, value: string) {
-  if (isVercel) {
-    // On Vercel: cannot write .env.local — return the value as-if saved.
-    // User must set env vars in Vercel dashboard.
-    return serializeEnvValue(value);
-  }
+  await ensureEnvDir();
   const safeValue = serializeEnvValue(value);
   const content = await readEnvLocal();
   const lines = content ? content.split(/\r?\n/) : [];
@@ -75,7 +75,5 @@ export async function writeEnvKey(key: string, value: string) {
 }
 
 export async function getGeminiApiKey() {
-  const fileValue = await readEnvKey("GEMINI_API_KEY");
-  if (fileValue) return fileValue;
-  return process.env.GEMINI_API_KEY?.trim() || "";
+  return readEnvKey("GEMINI_API_KEY");
 }
