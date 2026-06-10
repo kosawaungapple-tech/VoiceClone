@@ -4,6 +4,8 @@ import { getGeminiApiKey, maskSecret, writeEnvKey } from "@/lib/storage/env-stor
 
 export const runtime = "nodejs";
 
+const isVercel = process.env.VERCEL === "1";
+
 const requestSchema = z.object({
   apiKey: z.string().trim().min(1, "Gemini API key is required").max(500, "Gemini API key is too long")
 });
@@ -13,11 +15,22 @@ export async function GET() {
   return NextResponse.json({
     configured: Boolean(apiKey),
     maskedKey: maskSecret(apiKey),
-    source: apiKey ? "local-env" : "missing"
+    source: apiKey ? (isVercel ? "vercel-env" : "local-env") : "missing",
+    vercelMode: isVercel
   });
 }
 
 export async function POST(request: Request) {
+  if (isVercel) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Vercel မှာ API key ကို Settings dialog မှ သိမ်းမရပါ။ Vercel Dashboard → Project Settings → Environment Variables မှာ GEMINI_API_KEY ထည့်ပါ။"
+      },
+      { status: 422 }
+    );
+  }
+
   let body: unknown;
 
   try {

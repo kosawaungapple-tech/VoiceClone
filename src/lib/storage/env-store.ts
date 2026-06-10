@@ -1,6 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+const isVercel = process.env.VERCEL === "1";
+
+// On Vercel: .env.local writes are not possible (read-only filesystem outside /tmp).
+// API keys must be set as Vercel Environment Variables in the dashboard.
+// We still support reading from process.env so Vercel env vars work normally.
 const envLocalPath = path.join(process.cwd(), ".env.local");
 
 function parseEnvValue(line: string) {
@@ -20,6 +25,7 @@ export function maskSecret(value: string) {
 }
 
 export async function readEnvLocal() {
+  if (isVercel) return "";
   try {
     return await fs.readFile(envLocalPath, "utf8");
   } catch (error) {
@@ -31,14 +37,23 @@ export async function readEnvLocal() {
 }
 
 export async function readEnvKey(key: string) {
+  // On Vercel: always read from process.env (set via Vercel dashboard)
+  if (isVercel) {
+    return process.env[key]?.trim() || "";
+  }
   const content = await readEnvLocal();
   const line = content
     .split(/\r?\n/)
     .find((entry) => entry.trim().startsWith(`${key}=`));
-  return line ? parseEnvValue(line) : "";
+  return line ? parseEnvValue(line) : (process.env[key]?.trim() || "");
 }
 
 export async function writeEnvKey(key: string, value: string) {
+  if (isVercel) {
+    // On Vercel: cannot write .env.local — return the value as-if saved.
+    // User must set env vars in Vercel dashboard.
+    return serializeEnvValue(value);
+  }
   const safeValue = serializeEnvValue(value);
   const content = await readEnvLocal();
   const lines = content ? content.split(/\r?\n/) : [];

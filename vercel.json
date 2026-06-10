@@ -1,0 +1,16 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "next build",
+  "installCommand": "npm install",
+  "functions": {
+    "src/app/api/generate/route.ts": {
+      "maxDuration": 300
+    },
+    "src/app/api/rewrite/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/providers/voxcpm2/health/route.ts": {
+      "maxDuration": 30
+    }
+  }
+}

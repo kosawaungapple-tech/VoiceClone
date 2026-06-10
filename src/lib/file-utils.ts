@@ -1,7 +1,14 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 
-export const dataDir = path.join(process.cwd(), "data");
+// Vercel: use /tmp for writable storage (ephemeral but functional)
+// Local dev: use project data/ folder
+const isVercel = process.env.VERCEL === "1";
+
+export const dataDir = isVercel
+  ? path.join("/tmp", "thalika-data")
+  : path.join(process.cwd(), "data");
+
 export const scriptsDir = path.join(dataDir, "scripts");
 export const jobsDir = path.join(dataDir, "jobs");
 export const outputsDir = path.join(dataDir, "outputs");
