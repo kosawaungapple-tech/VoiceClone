@@ -1,0 +1,394 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import {
+  convertRemoteAudioToPcm24Wav,
+  getPunctuationAwarePauseMilliseconds,
+  mergeWavFiles
+} from "../audio-utils";
+import { ensureDataDirs, idStamp, outputsDir, safeJoin, sanitizeFilename } from "../file-utils";
+import { REMOTE_TTS_CHUNK_CHARACTERS } from "../script-limits";
+import { splitScriptIntoChunks } from "../script-chunker";
+import type { GenerateVoiceInput, GenerateVoiceResult, ReferenceAudioPayload, VoiceEmotion } from "../types";
+import { appendGenerationLog } from "../storage/generation-log";
+import type { TTSProvider } from "./base";
+import {
+  assertOkResponse,
+  extractAudioUrlFromEvents,
+  fetchTextWithTimeout,
+  fetchWithTimeout,
+  getHFInferenceTimeout,
+  getHFRequestTimeout,
+  parseSSEData,
+  parseUploadResponse,
+  readJsonResponse,
+  RemoteProviderError,
+  shouldRetryHFError,
+  summarizeRemoteEvents,
+  TimeoutError,
+  withRetry
+} from "./hf-utils";
+import { getVoxCPM2BaseUrl } from "./voxcpm2-health";
+
+const emotionControls: Record<VoiceEmotion, string> = {
+  neutral: "neutral expression",
+  calm: "calm and steady expression",
+  energetic: "energetic but speaker-consistent expression",
+  dramatic: "expressive but speaker-consistent delivery"
+};
+
+function speedControl(speed: number) {
+  if (speed <= 0.85) return "slow, deliberate pacing";
+  if (speed <= 0.95) return "slightly slower pacing";
+  if (speed >= 1.15) return "brisk pacing";
+  if (speed >= 1.05) return "slightly faster pacing";
+  return "natural pacing";
+}
+
+function decodeReferenceAudio(referenceAudio: ReferenceAudioPayload) {
+  const match = referenceAudio.dataUrl.match(/^data:(audio\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) {
+    throw new RemoteProviderError("Invalid reference audio", {
+      publicMessage: "VoxCPM2 requires a valid audio reference file."
+    });
+  }
+
+  return {
+    mimeType: match[1],
+    bytes: Buffer.from(match[2], "base64")
+  };
+}
+
+async function uploadReferenceAudio(baseUrl: string, referenceAudio: ReferenceAudioPayload) {
+  const { bytes, mimeType } = decodeReferenceAudio(referenceAudio);
+  const filename = sanitizeFilename(referenceAudio.filename || "reference.wav");
+  const form = new FormData();
+  form.append("files", new Blob([bytes], { type: mimeType }), filename);
+
+  const response = await fetchWithTimeout(`${baseUrl}/gradio_api/upload`, {
+    method: "POST",
+    body: form
+  });
+  assertOkResponse(response, "VoxCPM2 reference audio upload failed");
+
+  const json = await readJsonResponse<unknown>(response, "Invalid response from VoxCPM2 Space.");
+  return parseUploadResponse(json);
+}
+
+async function callVoxCPM2(
+  baseUrl: string,
+  input: GenerateVoiceInput,
+  uploadedReferencePath: string,
+  scriptChunk: string,
+  chunkIndex: number,
+  chunkCount: number,
+  useReferenceTranscript = true
+) {
+  const cloneMode = input.cloneMode || "high_fidelity";
+  const cloneStrength = Math.min(3, Math.max(1, input.cloneStrength ?? (cloneMode === "high_fidelity" ? 2.8 : 2.2)));
+  const denoiseReference = input.denoiseReference ?? false;
+  const normalizeText = input.normalizeText ?? true;
+  const referenceText = useReferenceTranscript ? input.referenceText?.trim() || "" : "";
+  const continuityInstruction =
+    chunkCount > 1
+      ? ` This is segment ${chunkIndex + 1} of ${chunkCount}; keep the same speaker identity, pace, volume, accent, and emotional style so all segments join naturally.`
+      : "";
+  const controlInstruction =
+    cloneMode === "high_fidelity"
+      ? `Preserve the uploaded speaker identity as closely as possible: timbre, accent, pitch range, rhythm, breath, tone, speaking style, and Burmese pronunciation. Use ${emotionControls[input.emotion]} with ${speedControl(input.speed)}.${continuityInstruction}`
+      : `Clone the uploaded speaker while keeping natural speech. Use ${emotionControls[input.emotion]} with ${speedControl(input.speed)}.${continuityInstruction}`;
+  const body = {
+    data: [
+      scriptChunk,
+      controlInstruction,
+      {
+        path: uploadedReferencePath,
+        orig_name: sanitizeFilename(input.referenceAudio?.filename || "reference.wav"),
+        mime_type: input.referenceAudio?.mimeType || "audio/wav",
+        meta: { _type: "gradio.FileData" }
+      },
+      Boolean(referenceText),
+      referenceText,
+      cloneStrength,
+      normalizeText,
+      denoiseReference
+    ]
+  };
+
+  const response = await fetchWithTimeout(`${baseUrl}/gradio_api/call/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  assertOkResponse(response, "VoxCPM2 remote inference failed");
+
+  const json = await readJsonResponse<{ event_id?: string }>(response, "Invalid response from VoxCPM2 Space.");
+  if (!json.event_id) {
+    throw new RemoteProviderError("Missing Gradio event id", {
+      publicMessage: "Invalid response from VoxCPM2 Space."
+    });
+  }
+
+  const { response: resultResponse, text: resultText } = await fetchTextWithTimeout(`${baseUrl}/gradio_api/call/generate/${json.event_id}`, {
+    method: "GET",
+    headers: { Accept: "text/event-stream" }
+  });
+  assertOkResponse(resultResponse, "VoxCPM2 remote inference failed");
+
+  const events = parseSSEData(resultText);
+  try {
+    return extractAudioUrlFromEvents(events, baseUrl);
+  } catch (error) {
+    await appendGenerationLog("remote_sse_without_audio", {
+      jobId: input.jobId,
+      chunk: chunkIndex + 1,
+      chunks: chunkCount,
+      referenceTranscriptRequested: Boolean(referenceText),
+      events: JSON.stringify(summarizeRemoteEvents(events)),
+      error: diagnosticError(error)
+    });
+    throw error;
+  }
+}
+
+async function downloadRemoteAudio(audioUrl: string) {
+  const response = await fetchWithTimeout(audioUrl, { method: "GET" });
+  assertOkResponse(response, "VoxCPM2 audio download failed");
+
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType && !contentType.includes("audio") && !contentType.includes("octet-stream")) {
+    throw new RemoteProviderError("Unexpected VoxCPM2 audio response type", {
+      publicMessage: "Invalid response from VoxCPM2 Space."
+    });
+  }
+
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length === 0) {
+    throw new RemoteProviderError("Empty VoxCPM2 audio response", {
+      publicMessage: "VoxCPM2 audio download failed."
+    });
+  }
+
+  return bytes;
+}
+
+function normalizeVoxCPM2Error(error: unknown) {
+  if (error instanceof TimeoutError) return "Remote inference timed out.";
+  if (error instanceof RemoteProviderError) return error.publicMessage;
+  return "VoxCPM2 remote inference failed";
+}
+
+function diagnosticError(error: unknown) {
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  return "Unknown remote inference error";
+}
+
+function shouldFallbackFromTranscript(error: unknown) {
+  return (
+    error instanceof RemoteProviderError &&
+    (error.message.startsWith("Missing audio output") || error.message.startsWith("Remote Space generation error"))
+  );
+}
+
+async function generateRemote(input: GenerateVoiceInput) {
+  if (!input.referenceAudio) {
+    throw new RemoteProviderError("Missing reference audio", {
+      publicMessage: "VoxCPM2 requires reference audio for voice cloning."
+    });
+  }
+  const referenceAudio = input.referenceAudio;
+
+  await ensureDataDirs();
+  const baseUrl = getVoxCPM2BaseUrl();
+  const chunks = splitScriptIntoChunks(input.script, REMOTE_TTS_CHUNK_CHARACTERS);
+  if (chunks.length === 0) {
+    throw new RemoteProviderError("Empty script", {
+      publicMessage: "Script is required."
+    });
+  }
+
+  const uploadedReferencePath = await withRetry(
+    () => uploadReferenceAudio(baseUrl, referenceAudio),
+    shouldRetryHFError,
+    2,
+    async (error, attempt) => {
+      await appendGenerationLog("reference_upload_retry", {
+        jobId: input.jobId,
+        attempt,
+        error: diagnosticError(error)
+      });
+    }
+  );
+  const outputStem = sanitizeFilename(`voice_${idStamp()}`);
+  const temporaryDir = await fs.mkdtemp(path.join(os.tmpdir(), "thalika-voxcpm2-"));
+  let result: GenerateVoiceResult | undefined;
+  let referenceTranscriptEnabled = Boolean(input.referenceText?.trim());
+  let transcriptFallbackUsed = false;
+
+  try {
+    const audioChunkPaths: string[] = [];
+    const remoteFormats = new Set<string>();
+    await appendGenerationLog("generation_started", {
+      jobId: input.jobId,
+      provider: "voxcpm2",
+      characters: input.script.length,
+      chunks: chunks.length
+    });
+    await input.onProgress?.({
+      completedChunks: 0,
+      totalChunks: chunks.length,
+      message: `Preparing ${chunks.length} audio segment${chunks.length === 1 ? "" : "s"}.`
+    });
+
+    for (const [chunkIndex, chunk] of chunks.entries()) {
+      await appendGenerationLog("chunk_started", {
+        jobId: input.jobId,
+        chunk: chunkIndex + 1,
+        chunks: chunks.length,
+        characters: chunk.length
+      });
+      await input.onProgress?.({
+        completedChunks: chunkIndex,
+        totalChunks: chunks.length,
+        message: `Generating audio segment ${chunkIndex + 1} of ${chunks.length}.`
+      });
+      const audio = await withRetry(
+        async () => {
+          let remoteAudioUrl: string;
+          try {
+            remoteAudioUrl = await callVoxCPM2(
+              baseUrl,
+              input,
+              uploadedReferencePath,
+              chunk,
+              chunkIndex,
+              chunks.length,
+              referenceTranscriptEnabled
+            );
+          } catch (error) {
+            if (!referenceTranscriptEnabled || !shouldFallbackFromTranscript(error)) throw error;
+            transcriptFallbackUsed = true;
+            referenceTranscriptEnabled = false;
+            await appendGenerationLog("transcript_mode_fallback", {
+              jobId: input.jobId,
+              chunk: chunkIndex + 1,
+              chunks: chunks.length,
+              error: diagnosticError(error)
+            });
+            remoteAudioUrl = await callVoxCPM2(baseUrl, input, uploadedReferencePath, chunk, chunkIndex, chunks.length, false);
+          }
+          return downloadRemoteAudio(remoteAudioUrl);
+        },
+        shouldRetryHFError,
+        2,
+        async (error, attempt) => {
+          await appendGenerationLog("chunk_retry", {
+            jobId: input.jobId,
+            chunk: chunkIndex + 1,
+            chunks: chunks.length,
+            attempt,
+            error: diagnosticError(error)
+          });
+        }
+      );
+      let converted;
+      try {
+        converted = await convertRemoteAudioToPcm24Wav(audio);
+      } catch {
+        throw new RemoteProviderError("Remote audio decode failed", {
+          publicMessage: "VoxCPM2 returned an audio segment that could not be decoded into PCM WAV."
+        });
+      }
+      const chunkPath = path.join(temporaryDir, `chunk-${chunkIndex}.wav`);
+      await fs.writeFile(chunkPath, converted.wav);
+      audioChunkPaths.push(chunkPath);
+      remoteFormats.add(converted.remoteFormat);
+      await appendGenerationLog("chunk_completed", {
+        jobId: input.jobId,
+        chunk: chunkIndex + 1,
+        chunks: chunks.length,
+        remoteFormat: converted.remoteFormat,
+        remoteBytes: audio.length,
+        pcmWavBytes: converted.wav.length
+      });
+      await input.onProgress?.({
+        completedChunks: chunkIndex + 1,
+        totalChunks: chunks.length,
+        message: `Generated audio segment ${chunkIndex + 1} of ${chunks.length}.`
+      });
+    }
+
+    const format = "wav";
+    const filename = sanitizeFilename(`${outputStem}.wav`);
+    const audioFilePath = safeJoin(outputsDir, filename);
+    const punctuationAwarePauses = chunks
+      .slice(0, -1)
+      .map(getPunctuationAwarePauseMilliseconds);
+    await appendGenerationLog("merge_started", {
+      jobId: input.jobId,
+      chunks: chunks.length,
+      format,
+      encoding: "pcm_s24le",
+      pausesMilliseconds: punctuationAwarePauses.join(",")
+    });
+    await mergeWavFiles(audioChunkPaths, audioFilePath, punctuationAwarePauses);
+    await appendGenerationLog("generation_completed", { jobId: input.jobId, chunks: chunks.length, filename, format });
+    result = {
+      filename,
+      audioFilePath,
+      format,
+      localAudioUrl: `/api/audio/${filename}`,
+      metadata: {
+        remoteProvider: "huggingface-space",
+        remoteBaseUrl: baseUrl,
+        remoteFormats: [...remoteFormats].join(","),
+        outputEncoding: "pcm_s24le",
+        outputSampleRate: 48_000,
+        outputChannels: 1,
+        outputBitDepth: 24,
+        pausePolicy: "punctuation-aware",
+        mode: "voxcpm2-controllable-cloning",
+        cloneMode: input.cloneMode || "high_fidelity",
+        cloneStrength: input.cloneStrength ?? 2.8,
+        denoiseReference: input.denoiseReference ?? false,
+        normalizeText: input.normalizeText ?? true,
+        referenceTranscriptUsed: Boolean(input.referenceText?.trim()),
+        transcriptFallbackUsed,
+        paceGuidance: speedControl(input.speed),
+        chunkedGeneration: chunks.length > 1,
+        chunkCount: chunks.length,
+        chunkMaxCharacters: REMOTE_TTS_CHUNK_CHARACTERS,
+        originalCharacters: input.script.length,
+        timeoutMs: getHFRequestTimeout(),
+        inferenceTimeoutMs: getHFInferenceTimeout()
+      }
+    };
+  } catch (error) {
+    await appendGenerationLog("generation_failed", {
+      jobId: input.jobId,
+      chunks: chunks.length,
+      error: diagnosticError(error),
+      publicMessage: normalizeVoxCPM2Error(error)
+    });
+    throw error;
+  } finally {
+    await fs.rm(temporaryDir, { recursive: true, force: true });
+  }
+
+  if (!result) throw new Error("VoxCPM2 generation completed without a local audio result.");
+  return result;
+}
+
+export const voxcpm2Provider: TTSProvider = {
+  id: "voxcpm2",
+  name: "VoxCPM2",
+  async generate(input) {
+    try {
+      return await generateRemote(input);
+    } catch (error) {
+      throw new RemoteProviderError("VoxCPM2 remote inference failed", {
+        publicMessage: normalizeVoxCPM2Error(error)
+      });
+    }
+  }
+};
